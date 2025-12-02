@@ -1,0 +1,270 @@
+#basic NetCDF plotting code
+
+"""
+Radar PPI plotting & batch visualization script.
+
+Features:
+- PPI plot with real distance scaling (km) using Distance_Info or Range_Bin_Resolution.
+- Reflectivity-style colormaps and sensible vmin/vmax from file global attributes.
+- Interactive zoom (mouse wheel) and pan (click-drag).
+- Animation across elevations (if file has multiple elevations).
+- Batch plot for all variables; saves PNG, JPG, PDF.
+- Creates output folders automatically.
+
+Author: ChatGPT
+"""
+
+import os
+import math
+import numpy as np
+import xarray as xr
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from matplotlib.animation import FuncAnimation
+import imageio     # for GIF (optional)
+from netCDF4 import Dataset
+
+# -----------------------
+# User: change this path if needed
+# -----------------------
+file_path = r"C:\Users\sdeep\OneDrive\Desktop\NetCDF files extraction using py code\DWRIGCAR-Level1A-IGCAR_OPERATIONAL-26-IGCAR_OPERATIONAL_250KM-2025-07-21-044856-ELE-21.0.nc"
+
+# Output base folder
+base_folder = os.path.dirname(file_path)
+output_root = os.path.join(base_folder, "Radar_Plots_Output")
+os.makedirs(output_root, exist_ok=True)
+
+# Open dataset (xarray for convenience)
+ds = xr.open_dataset(file_path)
+nc = Dataset(file_path, mode='r')  # for attrs if desired
+
+# Helpful global attrs (used for vmin/vmax defaults and metadata)
+global_attrs = ds.attrs
+# fallback ranges from global attributes if present
+Zmin = float(global_attrs.get("Zmin", -20.0))
+Zmax = float(global_attrs.get("Zmax", 60.0))
+Vmin = float(global_attrs.get("Vmin", -60.0))
+Vmax = float(global_attrs.get("Vmax", 60.0))
+Swmin = float(global_attrs.get("Swmin", 0.0))
+Swmax = float(global_attrs.get("Swmax", 10.0))
+Zdrmin = float(global_attrs.get("Zdrmin", -8.0))
+Zdrmax = float(global_attrs.get("Zdrmax", 5.0))
+CCmin = float(global_attrs.get("CCmin", 0.0))
+CCmax = float(global_attrs.get("CCmax", 1.0))
+
+# Range information (km)
+if "Distance_Info" in ds.variables:
+    ranges = np.array(ds["Distance_Info"])  # in file (likely in km or meters); check units
+    # If values appear large (e.g. > 1000) they might be in meters: convert to km if needed
+    if ranges.max() > 1000:
+        ranges_km = ranges / 1000.0
+    else:
+        ranges_km = ranges.copy()
+    print("Using Distance_Info for range bins.")
+else:
+    # Use Range_Bin_Resolution attr in meters
+    res_m = float(global_attrs.get("Range_Bin_Resolution", global_attrs.get("Netcdf_Resolution", 150.0)))
+    ranges_km = np.arange(ds.dims["Number_of_Range_Bins"]) * (res_m / 1000.0)
+    print(f"Using Range_Bin_Resolution = {res_m} m -> {res_m/1000.0} km per bin")
+
+# Azimuth information (degrees)
+if "Azimuth_Info" in ds.variables:
+    azim = np.array(ds["Azimuth_Info"].isel(Elevation_Count=0))
+    # Azimuth_Info might be (1,360) so flatten
+    azim = azim.flatten()
+    if azim.max() <= 2 * math.pi:  # maybe in radians
+        azim = np.rad2deg(azim)
+    print("Using Azimuth_Info for azimuth angles.")
+else:
+    azim = np.arange(ds.dims["Azimuth_Count"])
+    print("Using default 0..359 azimuths.")
+
+# Elevation index & count
+n_elev = ds.dims.get("Elevation_Count", 1)
+
+# Helper: get colormap + vmin/vmax per variable
+def get_colormap_and_range(var_name, da):
+    units = da.attrs.get("units", "")
+    name = var_name.lower()
+    if "reflect" in name or "reflectivity" in name or units.lower().startswith("dbz"):
+        cmap = cm.get_cmap("pyart_NWSRef") if "pyart_NWSRef" in plt.colormaps() else cm.get_cmap("viridis")
+        vmin, vmax = Zmin, Zmax
+    elif "velocity" in name or units.lower().startswith("m/s") or "vel" in name:
+        cmap = cm.get_cmap("RdBu_r")
+        vmin, vmax = Vmin, Vmax
+    elif "sw" in name or "spectrum" in name or "sw_" in name:
+        cmap = cm.get_cmap("magma")
+        vmin, vmax = Swmin, Swmax
+    elif "zdr" in name:
+        cmap = cm.get_cmap("PiYG")
+        vmin, vmax = Zdrmin, Zdrmax
+    elif "rho" in name or "ccor" in name:
+        cmap = cm.get_cmap("viridis")
+        vmin, vmax = CCmin, CCmax
+    elif "power" in name or units.lower().startswith("dbm"):
+        cmap = cm.get_cmap("inferno")
+        # power values may vary — use data percentile for robust range
+        arr = np.array(da).flatten()
+        arr = arr[~np.isnan(arr)]
+        if arr.size:
+            p1, p99 = np.percentile(arr, [1, 99])
+            vmin, vmax = float(p1), float(p99)
+        else:
+            vmin, vmax = -130, 0
+    else:
+        cmap = cm.get_cmap("viridis")
+        # default using percentiles
+        arr = np.array(da).flatten()
+        arr = arr[~np.isnan(arr)]
+        if arr.size:
+            p1, p99 = np.percentile(arr, [1, 99])
+            vmin, vmax = float(p1), float(p99)
+        else:
+            vmin, vmax = None, None
+
+    return cmap, vmin, vmax
+
+# Create single plotting function
+def plot_ppi_for_variable(var_name, save_png=True, save_jpg=True, save_pdf=True, interactive=False):
+    if var_name not in ds.variables:
+        print(f"Variable {var_name} not in dataset — skipping.")
+        return
+
+    da = ds[var_name]
+    dims = da.dims
+    shape = da.shape
+    units = da.attrs.get("units", "")
+
+    # Create folder for this variable
+    var_folder = os.path.join(output_root, var_name)
+    os.makedirs(var_folder, exist_ok=True)
+
+    cmap, vmin, vmax = get_colormap_and_range(var_name, da)
+
+    # For each elevation (some files have multiple)
+    frames = []
+    fig = None
+
+    for elev_idx in range(int(n_elev)):
+        # Extract slice: support shapes (1,360,N) and (1,360)
+        if da.ndim == 3 and da.shape[0] > elev_idx:
+            data = np.array(da.isel(Elevation_Count=elev_idx))
+            # if shape becomes (360, N) (xarray ordering might be (Azimuth_Count, Number_of_Range_Bins))
+            if data.shape[0] == ds.dims["Azimuth_Count"]:
+                ppi = data
+            else:
+                # try transpose if needed
+                ppi = data.reshape((ds.dims["Azimuth_Count"], -1))
+        elif da.ndim == 2 and da.shape[0] == 1:
+            data = np.array(da.isel(Elevation_Count=elev_idx)).flatten()
+            # Make (360, 1)
+            ppi = data.reshape((ds.dims["Azimuth_Count"], -1))
+        else:
+            # unsupported shape - try to coerce
+            ppi = np.array(da)
+            if ppi.ndim == 3:
+                ppi = ppi[0]
+
+        # Prepare theta, r mesh for pcolormesh
+        # theta must have shape (azimuth+1) x (range+1) for pcolormesh cell edges
+        azimuths = azim
+        nr = ppi.shape[1]
+        na = ppi.shape[0]
+        # Build edges for theta and r
+        theta_edges = np.deg2rad(np.concatenate([azimuths, [azimuths[0]]]))  # wrap for pcolormesh
+        # but simpler: create midpoints and use meshgrid with shading='auto'
+        theta_mid = np.deg2rad(azimuths)
+        r_mid = ranges_km[:nr]
+        theta_grid, r_grid = np.meshgrid(theta_mid, r_mid, indexing='ij')  # shape (na, nr)
+
+        # Matplotlib polar expects r as radial, theta as angle
+        # Create figure
+        fig = plt.figure(figsize=(8,8))
+        ax = fig.add_subplot(111, projection='polar')
+        ax.set_theta_zero_location("N")
+        ax.set_theta_direction(-1)
+
+        # Make sure we plot r increasing outward
+        # pcolormesh wants shape (na, nr)
+        # For display, convert r_grid & theta_grid to appropriate dims for pcolormesh
+        # transpose data for pcolormesh? We'll use pcolormesh(theta_grid, r_grid, ppi)
+        # ppi shape should match theta_grid/r_grid (na, nr)
+        c = ax.pcolormesh(theta_grid, r_grid, ppi, shading='auto', cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_ylim(0, r_mid.max())
+
+        # Add colorbar
+        cb = plt.colorbar(c, ax=ax, orientation='vertical', pad=0.05)
+        cb.set_label(units)
+
+        ax.set_title(f"{var_name} | Elevation index: {elev_idx} | Units: {units}")
+
+        # Save files
+        fname_base = f"{var_name}_E{elev_idx}"
+        if save_png:
+            out_png = os.path.join(var_folder, fname_base + ".png")
+            fig.savefig(out_png, dpi=200, bbox_inches='tight')
+        if save_jpg:
+            out_jpg = os.path.join(var_folder, fname_base + ".jpg")
+            fig.savefig(out_jpg, dpi=150, bbox_inches='tight', quality=95)
+        if save_pdf:
+            out_pdf = os.path.join(var_folder, fname_base + ".pdf")
+            fig.savefig(out_pdf, bbox_inches='tight')
+        print(f"Saved plots for {var_name} elevation {elev_idx} -> {var_folder}")
+
+        # Save frame for animation as an array
+        fig.canvas.draw()
+        image = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
+        image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        frames.append(image)
+
+        plt.close(fig)
+
+    # Create animation (GIF + MP4)
+    if frames:
+        try:
+            gif_path = os.path.join(var_folder, f"{var_name}_animation.gif")
+            imageio.mimsave(gif_path, frames, fps=1)
+            print(f"Saved GIF animation: {gif_path}")
+        except Exception as e:
+            print(f"Could not create GIF (imageio error): {e}")
+
+        # MP4: requires ffmpeg installed in system
+        try:
+            mp4_path = os.path.join(var_folder, f"{var_name}_animation.mp4")
+            imageio.mimsave(mp4_path, frames, fps=1, codec='libx264')
+            print(f"Saved MP4 animation: {mp4_path}")
+        except Exception as e:
+            print(f"Could not create MP4 animation (ffmpeg may be missing): {e}")
+
+    # Interactive plotting: show last figure for zoom/pan (optional)
+    if interactive and fig is not None:
+        plt.show()
+
+# --------------------------
+# Batch process: choose which variables to plot as PPI
+# --------------------------
+# We'll plot all variables that have Azimuth_Count and Number_of_Range_Bins dims or Number_of_Tx_Range_Bins
+plot_vars = []
+for vname, var in ds.variables.items():
+    dims = var.dims
+    if ("Azimuth_Count" in dims) and (("Number_of_Range_Bins" in dims) or ("Number_of_Tx_Range_Bins" in dims)):
+        plot_vars.append(vname)
+
+# Optionally include 2D and 1D that are Azimuth_Info / Elevation_Info etc. (not needed for PPI)
+print("Variables detected for PPI plotting:", plot_vars)
+
+# Create overall summary folder
+os.makedirs(output_root, exist_ok=True)
+
+# Loop and plot
+for v in plot_vars:
+    try:
+        plot_ppi_for_variable(v, save_png=True, save_jpg=True, save_pdf=True, interactive=False)
+    except Exception as e:
+        print(f"Error plotting {v}: {e}")
+
+print("Batch plotting complete. Output root:", output_root)
+
+# Close dataset
+ds.close()
+nc.close()
